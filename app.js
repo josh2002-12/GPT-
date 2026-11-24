@@ -16,7 +16,65 @@ function stop(){run++;clearTimeout(timer);stream?.getTracks().forEach(t=>t.stop(
 function show(row){stop();fields.forEach((f,i)=>f.value=row[i]);$('#review').hidden=false;msg('已讀取發票，請核對後儲存。');$('#review').scrollIntoView({block:'nearest'})}
 $('#scan').onclick=async()=>{stop();const id=run;$('#review').hidden=true;try{const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});if(id!==run){s.getTracks().forEach(t=>t.stop());return}stream=s;video.srcObject=s;$('#camera').hidden=false;await video.play();msg('請將左側 QR Code 移到畫面中央。');function tick(){if(id!==run)return;if(video.readyState>=2){const row=read(video,video.videoWidth,video.videoHeight);if(row)return show(row)}timer=setTimeout(tick,220)}tick()}catch{if(id===run){stop();msg('無法開啟相機，請允許使用相機，或選擇照片。')}}};
 $('#stop').onclick=()=>{stop();msg('已關閉相機。')};window.addEventListener('pagehide',stop);
-$('#upload').onclick=()=>{stop();$('#file').click()};$('#file').onchange=async e=>{const f=e.target.files[0];if(!f)return;const id=run,url=URL.createObjectURL(f);$('#review').hidden=true;try{const img=new Image();img.src=url;await img.decode();if(id!==run)return;const row=read(img,img.width,img.height);if(row)show(row);else msg('未讀到發票，請拍清楚左側 QR Code 再試一次。')}catch{msg('無法讀取照片，請改選 JPG 或 PNG。')}finally{URL.revokeObjectURL(url);e.target.value=''}};
+$('#upload').onclick=()=>{stop();$('#file').click()};async function openPhoto(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = reject;
+      image.src = url;
+    });
+    return image;
+  } catch (error) {
+    if (/\.hei[cf]$/i.test(file.name) || /image\/hei[cf]/i.test(file.type)) {
+      const { heicTo } = await import('./heic.mjs');
+      return await heicTo({blob: file, type: 'bitmap'});
+    }
+    if (window.createImageBitmap) return await createImageBitmap(file);
+    throw error;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+$('#file').onchange = async event => {
+  const file = event.target.files[0];
+  if (!file) return;
+  const id = ++run;
+  event.target.value = '';
+  $('#review').hidden = true;
+  msg('正在讀取照片…');
+  let image;
+  try {
+    image = await openPhoto(file);
+  } catch {
+    if (id === run) msg('照片無法開啟。可將發票照片截圖，再選取截圖。');
+    return;
+  }
+  try {
+    if (id !== run) return;
+    if (typeof jsQR !== 'function') {
+      msg('QR 掃描元件載入失敗，請重新整理頁面。');
+      return;
+    }
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    const row = readPhotoQR(image, width, height);
+    if (row) return show(row);
+    msg('未讀到條碼，正在啟動文字辨識…');
+    try {
+      await recognizePhoto(image, width, height, id);
+    } catch {
+      if (id !== run) return;
+      show(['','','','','']);
+      msg('文字辨識無法完成。請對照原發票填寫，或重新選擇照片。');
+    }
+  } catch {
+    msg('照片已開啟，但掃描失敗。請裁切至左側 QR Code 再試一次。');
+  } finally {
+    image.close?.();
+  }
+};
 const key='invoice-pocket-v1',records=()=>JSON.parse(localStorage.getItem(key)||'[]');
 function render(){const rows=records();$('#list').replaceChildren();$('#download').disabled=!rows.length;if(!rows.length){const p=document.createElement('div');p.className='empty';p.textContent='尚無紀錄，掃描第一張發票即可開始。';$('#list').append(p)}for(const [num,date,total,s,b] of rows){const el=document.createElement('div'),line=document.createElement('strong'),meta=document.createElement('small');el.className='record';line.textContent=num+'　NT$ '+Number(total).toLocaleString();meta.textContent=date+'　賣方 '+s+'　買方 '+(b||'未填寫');el.append(line,document.createElement('br'),meta);$('#list').append(el)}}
 $('form').onsubmit=e=>{e.preventDefault();const row=fields.map(f=>f.value);row[2]=Number(row[2]);try{const rows=records();if(rows.some(r=>r[0]===row[0]&&r[1].slice(0,4)===row[1].slice(0,4)))return msg('這張發票已經登錄。');localStorage.setItem(key,JSON.stringify([row,...rows]));render();$('#review').hidden=true;msg('已儲存發票。')}catch{msg('儲存失敗，請確認瀏覽器允許本機儲存。')}};
