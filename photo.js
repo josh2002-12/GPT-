@@ -52,6 +52,26 @@ function extractFields(text) {
   return [number ? number[1]+number[2] : '', date, total ? total[1].replace(/,/g,'') : '', labeledId(normalized,'seller'), labeledId(normalized,'buyer')];
 }
 
+// Restore reading order when OCR splits the printed label across text blocks.
+function sellerFromWords(words) {
+  const found = new Set();
+  for (const candidate of words) {
+    const digits = candidate.text.normalize('NFKC').trim();
+    if (!/^\d{8}$/.test(digits)) continue;
+    const box = candidate.bbox;
+    const h = box.y1 - box.y0;
+    const center = (box.y0 + box.y1) / 2;
+    const left = words.filter(word => {
+      const b = word.bbox;
+      return b.x1 <= box.x0 + 1 && box.x0 - b.x1 < 6 * h &&
+        Math.abs((b.y0 + b.y1) / 2 - center) <= 0.65 * h;
+    }).sort((a,b) => a.bbox.x0-b.bbox.x0);
+    const label = left.map(word => word.text).join('').normalize('NFKC').replace(/\s/g,'');
+    if (/(?:賣方|銷售人|開立人)(?:統一編號|統編)?[:﹕]?$/.test(label)) found.add(digits);
+  }
+  return found.size === 1 ? [...found][0] : '';
+}
+
 async function recognizePhoto(image, width, height, id) {
   const surface = document.createElement('canvas');
   const scale = Math.min(1, 3000 / Math.max(width, height));
@@ -77,6 +97,12 @@ async function recognizePhoto(image, width, height, id) {
       if (run !== id) return;
       const recovered = extractFields(retry.data.text);
       for (const i of [1, 3]) if (!row[i]) row[i] = recovered[i];
+    }
+    if (!row[3]) {
+      await worker.setParameters({tessedit_pageseg_mode: '3'});
+      const {data: layout} = await worker.recognize(surface);
+      if (run !== id) return;
+      row[3] = labeledId(layout.text.normalize('NFKC'), 'seller') || sellerFromWords(layout.words || []);
     }
     show(row);
     msg(row.some(Boolean) ? '文字辨識完成，請對照原發票確認每個欄位。' : '讀不到清楚的欄位，請對照原發票填寫，或重拍近一點。');
