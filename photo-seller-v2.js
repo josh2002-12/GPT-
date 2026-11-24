@@ -114,6 +114,32 @@ async function sellerAboveBarcode(surface, worker) {
   return '';
 }
 
+function prepareTotalLine(surface, band, threshold) {
+  const crop = document.createElement('canvas');
+  crop.width = 700;
+  crop.height = 190;
+  const ctx = crop.getContext('2d');
+  const w = band.width;
+  ctx.drawImage(surface, band.x + .48*w, band.y - .24*w, .48*w, .13*w, 0, 0, crop.width, crop.height);
+  const pixels = ctx.getImageData(0, 0, crop.width, crop.height);
+  for (let i = 0; i < pixels.data.length; i += 4) {
+    const value = pixels.data[i+1] < threshold ? 0 : 255;
+    pixels.data[i] = pixels.data[i+1] = pixels.data[i+2] = value;
+  }
+  ctx.putImageData(pixels, 0, 0);
+  return crop;
+}
+
+function confirmedAmount(values) {
+  const counts = new Map();
+  for (const value of values) {
+    if (value !== '') counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  const ranked = [...counts].sort((a,b) => b[1]-a[1]);
+  if (!ranked.length || ranked[0][1] < 2 || ranked[0][1] === ranked[1]?.[1]) return '';
+  return ranked[0][0];
+}
+
 async function recognizePhoto(image, width, height, id) {
   const surface = document.createElement('canvas');
   const scale = Math.min(1, 3000 / Math.max(width, height));
@@ -133,28 +159,26 @@ async function recognizePhoto(image, width, height, id) {
     const {data} = await worker.recognize(surface);
     if (run !== id) return;
     const row = extractFields(data.text);
-    if (!row[3]) {
-      row[3] = await sellerAboveBarcode(surface, worker);
-      const band = findBarcodeTop(surface);
-      if (band && row[3]) {
-        const totalLine = document.createElement('canvas');
-        totalLine.width = 700; totalLine.height = 190;
-        totalLine.getContext('2d').drawImage(surface, band.x+.48*band.width, band.y-.24*band.width, .48*band.width, .13*band.width, 0,0,700,190);
-        const tc = totalLine.getContext("2d"), pixels = tc.getImageData(0,0,700,190);
-        for(let i=0;i<pixels.data.length;i+=4){const v=pixels.data[i+1]<155?0:255;pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=v;}
-        tc.putImageData(pixels,0,0);
-        const amount = extractFields((await worker.recognize(totalLine)).data.text)[2];
-        if (amount) row[2] = amount;
+    const amounts = [row[2]];
+    if (!row[3]) row[3] = await sellerAboveBarcode(surface, worker);
+    if (run !== id) return;
+    await worker.setParameters({tessedit_pageseg_mode: '11'});
+    const retry = await worker.recognize(surface);
+    if (run !== id) return;
+    const recovered = extractFields(retry.data.text);
+    for (const i of [0, 1, 3, 4]) if (!row[i]) row[i] = recovered[i];
+    amounts.push(recovered[2]);
+    const band = findBarcodeTop(surface);
+    if (band) {
+      await worker.setParameters({tessedit_pageseg_mode: '7'});
+      for (const threshold of [155, 175]) {
+        const crop = prepareTotalLine(surface, band, threshold);
+        const result = await worker.recognize(crop);
+        if (run !== id) return;
+        amounts.push(extractFields(result.data.text)[2]);
       }
     }
-    if (run !== id) return;
-    if (!row[0] || !row[1] || !row[2] || !row[3]) {
-      await worker.setParameters({tessedit_pageseg_mode: '11'});
-      const retry = await worker.recognize(surface);
-      if (run !== id) return;
-      const recovered = extractFields(retry.data.text);
-      for (const i of [0, 1, 2, 3]) if (!row[i]) row[i] = recovered[i];
-    }
+    row[2] = confirmedAmount(amounts);
     if (!row[3]) {
       await worker.setParameters({tessedit_pageseg_mode: '3'});
       const {data: layout} = await worker.recognize(surface);
@@ -162,7 +186,7 @@ async function recognizePhoto(image, width, height, id) {
       row[3] = labeledId(layout.text.normalize('NFKC'), 'seller') || sellerFromWords(layout.words || []);
     }
     show(row);
-    msg(row.some(Boolean) ? '文字辨識完成，請對照原發票確認每個欄位。' : '讀不到清楚的欄位，請對照原發票填寫，或重拍近一點。');
+    msg(!row[2] ? '總金額未能確認，請對照發票上的總計填寫。' : row.some(Boolean) ? '文字辨識完成，請對照原發票確認每個欄位。' : '讀不到清楚的欄位，請對照原發票填寫，或重拍近一點。');
   } finally {
     await worker.terminate();
   }
