@@ -12,22 +12,44 @@ function readPhotoQR(image, width, height) {
   return null;
 }
 
+function issueDate(text) {
+  const pattern = /(?:^|[^\d])(20\d{2}|1\d{2}|09\d)\s*[-./年]\s*(\d{1,2})\s*[-./月]\s*(\d{1,2})(?!\d|\s*月)/g;
+  const labeled = text.split('\n').filter(line => /開立日期|發票日期|交易日期/.test(line.replace(/\s/g,'')));
+  for (const line of [...labeled, ...text.split('\n')]) {
+    if (/到期|有效期限|列印日期/.test(line)) continue;
+    for (const match of line.matchAll(pattern)) {
+      const [,year,month,day] = match;
+      const date = [year.length === 3 ? Number(year)+1911 : year, month.padStart(2,'0'), day.padStart(2,'0')].join('-');
+      const parsed = new Date(date+'T00:00:00Z');
+      if (Number.isFinite(+parsed) && parsed.toISOString().startsWith(date)) return date;
+    }
+  }
+  return '';
+}
+
+function labeledId(text, role) {
+  const label = role === 'seller' ? '(?:賣方|銷售人|開立人|營業人)' : '(?:買方|買受人)';
+  const idLabel = '(?:統一編號|統編|統一號碼)';
+  const digits = '[:#﹕]?\\s*(\\d{4}[- ]?\\d{4})(?!\\d)';
+  const compact = text.replace(/[^\S\n]+/g,'');
+  const pattern = new RegExp(label+'\\s*(?:[（(]?'+idLabel+'[）)]?)?'+digits,'g');
+  const matches = [...compact.matchAll(pattern)].map(m => m[1].replace(/\D/g,''));
+  if (matches.length) return new Set(matches).size === 1 ? matches[0] : '';
+  if (role === 'seller' && !/買方|買受人/.test(compact)) {
+    const standalone = [...compact.matchAll(new RegExp('^'+idLabel+digits+'(?=$|[^0-9])','gm'))];
+    if (standalone.length === 1) return standalone[0][1].replace(/\D/g,'');
+  }
+  return '';
+}
+
 function extractFields(text) {
   const lines = text.normalize('NFKC').toUpperCase().split(/\r?\n/).map(line => line.replace(/\s/g, ''));
   const joined = lines.join('\n');
   const number = joined.match(/(?:^|[^A-Z0-9])([A-Z]{2})[-–—]?(\d{8})(?!\d)/);
-  const dateParts = joined.match(/(?:^|[^\d])(\d{3}|20\d{2})[-./年](\d{1,2})[-./月](\d{1,2})(?!\d)/);
-  let date = '';
-  if (dateParts) {
-    const [,year,month,day] = dateParts;
-    const value = [year.length === 3 ? +year+1911 : year, month.padStart(2,'0'), day.padStart(2,'0')].join('-');
-    const parsed = new Date(value+'T00:00:00Z');
-    if (Number.isFinite(+parsed) && parsed.toISOString().startsWith(value)) date = value;
-  }
+  const normalized = text.normalize('NFKC').replace(/[‐‑–—−]/g,'-');
+  const date = issueDate(normalized);
   const total = joined.match(/(?:總計|總金額|應付金額|含稅合計|GRANDTOTAL|^TOTAL)[:：]?(?:NT\$?|新臺幣|新台幣|TWD|\$)?([\d,]+)(?:\.00)?(?:元|圓)?$/m);
-  const seller = joined.match(/(?:賣方|銷售人)(?:統一編號|統編)?[:：]?(\d{8})(?!\d)/);
-  const buyer = joined.match(/(?:買方|買受人)(?:統一編號|統編)?[:：]?(\d{8})(?!\d)/);
-  return [number ? number[1]+number[2] : '', date, total ? total[1].replace(/,/g,'') : '', seller?.[1] || '', buyer?.[1] || ''];
+  return [number ? number[1]+number[2] : '', date, total ? total[1].replace(/,/g,'') : '', labeledId(normalized,'seller'), labeledId(normalized,'buyer')];
 }
 
 async function recognizePhoto(image, width, height, id) {
@@ -49,6 +71,13 @@ async function recognizePhoto(image, width, height, id) {
     const {data} = await worker.recognize(surface);
     if (run !== id) return;
     const row = extractFields(data.text);
+    if (!row[1] || !row[3]) {
+      await worker.setParameters({tessedit_pageseg_mode: '11'});
+      const retry = await worker.recognize(surface);
+      if (run !== id) return;
+      const recovered = extractFields(retry.data.text);
+      for (const i of [1, 3]) if (!row[i]) row[i] = recovered[i];
+    }
     show(row);
     msg(row.some(Boolean) ? '文字辨識完成，請對照原發票確認每個欄位。' : '讀不到清楚的欄位，請對照原發票填寫，或重拍近一點。');
   } finally {
